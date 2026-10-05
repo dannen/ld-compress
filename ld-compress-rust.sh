@@ -1,7 +1,21 @@
 #!/bin/bash
+# Same pipeline as ld-compress.sh, but Stage 2 uses ld-decode-rust (NTSC only).
 
+# Rust decoder binary and demod thread count (-j 9 benchmarked as fastest per CPU)
+LD_DECODE_RUST="${LD_DECODE_RUST:-$HOME/laserdiscs/ld-decode-rust/target/release/ld-decode}"
+LD_DECODE_THREADS="${LD_DECODE_THREADS:-9}"
+# Optional start frame. The Rust decoder never regains sync if it loses it in
+# spin-up noise at the start of a capture; set this to a frame inside the
+# lead-in to skip the noise, e.g. LD_DECODE_START=145
+LD_DECODE_START="${LD_DECODE_START:-}"
 # Optional number of frames to decode (e.g. LD_DECODE_LENGTH=2700 for ~90s)
 LD_DECODE_LENGTH="${LD_DECODE_LENGTH:-}"
+
+if [ ! -x "$LD_DECODE_RUST" ]; then
+  echo "Error: Rust ld-decode not found at $LD_DECODE_RUST"
+  echo "Build it with: cd ~/laserdiscs/ld-decode-rust && cargo build --release"
+  exit 1
+fi
 
 # Usage check
 if [ "$#" -lt 1 ]; then
@@ -88,10 +102,11 @@ fi
 
 # Use --dod to create dropout masks in JSON for subsequent correction
 ask_overwrite "${BASE_NAME}.tbc" && {
-  LENGTH_ARGS=()
-  [ -n "$LD_DECODE_LENGTH" ] && LENGTH_ARGS=(-l "$LD_DECODE_LENGTH") && echo "Decoding $LD_DECODE_LENGTH frames"
-  #ld-decode "$RF_INPUT" "${BASE_NAME}" --ntsc || {
-  ~/laserdiscs/ld-decode/ld-decode "${LENGTH_ARGS[@]}" "$RF_INPUT" "${BASE_NAME}" --NTSC || {
+  # ld-decode-rust is NTSC-only, so there is no --NTSC flag
+  START_ARGS=()
+  [ -n "$LD_DECODE_START" ] && START_ARGS=(-s "$LD_DECODE_START") && echo "Starting decode at frame $LD_DECODE_START"
+  [ -n "$LD_DECODE_LENGTH" ] && START_ARGS+=(-l "$LD_DECODE_LENGTH") && echo "Decoding $LD_DECODE_LENGTH frames"
+  "$LD_DECODE_RUST" -j "$LD_DECODE_THREADS" "${START_ARGS[@]}" "$RF_INPUT" "${BASE_NAME}" || {
     echo "ld-decode failed"; exit 1;
   }
 } || echo "Skipping initial ld-decode (Stage 2)"
@@ -256,7 +271,7 @@ if [ "$CLEAN" -eq 1 ]; then
   echo "==> Stage 9: Cleaning intermediate files"
   # Removed _rgb.tbc from cleanup as it's no longer created
   rm -f "${BASE_NAME}.tbc" "${BASE_NAME}.pcm" "${BASE_NAME}.efm" "${BASE_NAME}.log" \
-        "${BASE_NAME}.vbi.json" "${BASE_NAME}.tbc.json" \
+        "${BASE_NAME}.vbi.json" "${BASE_NAME}.tbc.json" "${BASE_NAME}.tbc.db" \
         "${BASE_NAME}_corr.tbc" "${BASE_NAME}_corr.tbc.json"
 fi
 

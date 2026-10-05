@@ -1,271 +1,161 @@
-LaserDisc Archival Processing Script (ld-compress.sh)
+# ld-compress
 
-This script automates a multi-stage workflow for archiving LaserDisc content, focusing on video decoding, dropout correction, VBI data extraction, and final video encoding. It leverages various tools from the vhs-decode project and standard Linux utilities.
-Table of Contents
+These scripts turn a Domesday Duplicator RF capture of an NTSC LaserDisc into
+an archival FFV1/PCM MKV. They handle compression, decoding, dropout
+correction, VBI, chroma decoding, captions and checksums.
 
-    Introduction
+There are two versions. They run the same pipeline and differ only in the
+decoder used in Stage 2:
 
-    Features
+| Script | Stage 2 decoder | Notes |
+|---|---|---|
+| `ld-compress.sh` | Python ld-decode (`~/laserdiscs/ld-decode/ld-decode --NTSC`) | Reference decoder. Slow (~2–5 FPS) |
+| `ld-compress-rust.sh` | `ld-decode-rust` (`~/laserdiscs/ld-decode-rust/target/release/ld-decode -j 9`) | Byte-identical output, roughly 9–20x faster (~43 FPS). **NTSC only** |
 
-    Prerequisites
+Use the Rust version unless you need PAL or are checking against the
+reference decoder.
 
-    Installation & Setup
+## Usage
 
-    Usage
+Run the script from the folder that holds the capture. Pass the base name
+**without an extension**:
 
-    Workflow Stages
+```bash
+cd /path/to/capture/folder
+~/laserdiscs/ld-compress-rust.sh <base_name> [--nodeint] [--force] [--clean]
+~/laserdiscs/ld-compress.sh      <base_name> [--nodeint] [--force] [--clean]
+```
 
-    Important Notes & Troubleshooting
+Example:
 
-    License
+```bash
+~/laserdiscs/ld-compress-rust.sh RF-Sample_2026-10-01_20-15-01_side1 --nodeint
+```
 
-1. Introduction
+Stage 2 reads the first input it finds, in this order: `<base_name>.lds`,
+`<base_name>.ldf`, `<base_name>.flac.ldf`.
 
-ld-compress.sh is a Bash script designed to streamline the complex process of digitizing LaserDisc content. It takes raw RF captures (typically from a Domesday Duplicator) and processes them through several steps, including dropout correction, VBI data extraction, and encoding into a high-quality FFV1 MKV file, with optional subtitle extraction and muxing.
+### Flags
 
-The script is designed to be interactive, prompting the user to skip or overwrite existing intermediate files, making it suitable for iterative processing or resuming interrupted workflows.
-2. Features
+Flags go after the base name, in any order.
 
-    RF Data Compression: Converts raw .lds files to compressed .ldf (FLAC-compressed RF).
+| Flag | Effect |
+|---|---|
+| `--nodeint` | Skip `bwdif` deinterlacing. The output stays as 29.97 interlaced frames, about 44% smaller than the 59.94p deinterlaced output. See the [field-order note](#known-issues). |
+| `--force` | Don't prompt. Overwrite every existing output (passes `-y` to ffmpeg). |
+| `--clean` | Run Stage 9 at the end, which deletes the intermediates (see [Outputs](#outputs)). This includes `.vbi.json`. Use it only when you want a fresh start next time. |
 
-    RF Decoding: Decodes compressed RF data into .tbc (Time Base Corrected) format, generating associated JSON metadata.
+### Environment variables
 
-    Dropout Correction: Applies dropout correction using ld-dropout-correct.
+Set these before the command, e.g.
+`LD_DECODE_START=145 ~/laserdiscs/ld-compress-rust.sh <base_name> --nodeint`.
 
-    VBI Data Processing: Extracts Vertical Blanking Interval (VBI) data (e.g., closed captions, timecodes) into a dedicated JSON file.
+| Variable | Script | Default | Purpose |
+|---|---|---|---|
+| `LD_DECODE_LENGTH` | both | (all) | Decode only N frames, e.g. `2700` ≈ 90 s for a quick test |
+| `LD_DECODE_START` | rust | (0) | Start decoding at frame N. The Rust decoder never regains sync once it loses it in spin-up noise at the start of a capture. If a decode comes out nearly empty, set this to a frame inside the lead-in, e.g. `145` |
+| `LD_DECODE_THREADS` | rust | `9` | Demod threads. `-j 9` benchmarked fastest on the 5800X3D |
+| `LD_DECODE_RUST` | rust | `~/laserdiscs/ld-decode-rust/target/release/ld-decode` | Decoder binary. If it's missing, build it with `cd ~/laserdiscs/ld-decode-rust && cargo build --release` |
 
-    Chroma Decoding & Encoding: Processes TBC data for chroma decoding, deinterlacing, and encodes the final video into an FFV1 MKV container.
+## Pipeline
 
-    Audio Passthrough: Integrates PCM audio from the decoding stage into the final MKV.
+| Stage | Tool | Input → output |
+|---|---|---|
+| 1. Compress RF | `ld-compress -a` | `.lds` → `.flac.ldf` (skipped if a `.ldf`/`.flac.ldf` already exists) |
+| 2. Decode RF | ld-decode (Python or Rust) | RF → `.tbc`, `.tbc.json`, `.pcm`, `.efm`, `.log` (Rust also writes `.tbc.db`) |
+| — Field fix | inline Python | Drops an unpaired trailing first field from `.tbc.json`. Without this, `ld-process-vbi` reads past the end of `_corr.tbc` and aborts |
+| 3. Dropout correction | `ld-dropout-correct` | `.tbc` → `_corr.tbc`, `_corr.tbc.json` (any old outputs are removed first, because the tool refuses to overwrite) |
+| 4. VBI | `ld-process-vbi --nobackup` | `_corr.tbc` → `.vbi.json` |
+| 5. Chroma + encode | `ld-chroma-decoder -f ntsc3d` piped to `ffmpeg` | `_corr.tbc` + `.pcm` → `_archival.mkv` |
+| 6. Captions | `ccextractor` | `_archival.mkv` → `.srt` |
+| 7. Caption mux | `ffmpeg` | → `_archival_with_subs.mkv` (only if `.srt` is non-empty) |
+| 8. Checksum | `sha256sum` | → `_archival.sha256` (covers both MKVs; regenerated only when an MKV is newer than it) |
+| 9. Cleanup | `rm` | only with `--clean` |
 
-    Subtitle Extraction & Muxing: Extracts closed captions (if present) and muxes them into a separate MKV.
+Stage 5 encode settings:
+- Chroma decoder: `ntsc3d --luma-nr 0.2 --chroma-gain 1.0 --chroma-nr 0.1`, RGB48 at 760x488.
+- Video: FFV1 level 3, `yuv444p`, GOP 1, 24 slices with slice CRCs, 4:3, smpte170m colour tags.
+- Optional deinterlace: `bwdif=mode=1:parity=-1:deint=all`.
+- Audio: 44.1 kHz stereo PCM s16le, taken from the decoder's `.pcm`.
 
-    Checksum Generation: Creates a SHA-256 checksum for the archival MKV.
+## Outputs
 
-    Interactive Skipping: Prompts the user to skip or overwrite existing intermediate files for efficient re-runs.
+| File | Kept after `--clean`? |
+|---|---|
+| `<base>.flac.ldf` (compressed RF) | yes |
+| `<base>_archival.mkv` | yes |
+| `<base>_archival_with_subs.mkv` (if captions exist) | yes |
+| `<base>.srt` | yes |
+| `<base>_archival.sha256` | yes |
+| `.tbc`, `.tbc.json`, `.tbc.db`, `_corr.tbc`, `_corr.tbc.json`, `.pcm`, `.efm`, `.log`, `.vbi.json` | no |
 
-    Force Mode: Allows non-interactive overwriting of existing files.
+The original `.lds` is never deleted by the scripts.
 
-    Cleanup Mode: Removes intermediate files after successful completion.
+## Re-running and the overwrite prompts
 
-3. Prerequisites
+When an output already exists (and `--force` isn't set), the script asks:
 
-This script relies on a specific set of tools, primarily from the vhs-decode project, which has a hybrid structure (some tools are Python-based, others are C++ and require compilation).
-
-    Operating System: Linux (Ubuntu/Debian-based distributions are assumed for package manager commands).
-
-    vhs-decode Tools:
-
-        Python Components (via pipx): ld-decode, ld-compress.
-
-        C++ Components (via source build): ld-dropout-correct, ld-chroma-decoder, ld-process-vbi, ld-analyse.
-
-    FFmpeg: Command-line multimedia framework.
-
-    CCExtractor: Tool for extracting closed captions.
-
-    Standard Utilities: sha256sum, rm, cp, touch, read, echo, ls, which (typically pre-installed).
-
-4. Installation & Setup
-
-Follow these steps carefully to ensure all necessary tools are installed and correctly configured in your system's PATH.
-A. Clone the vhs-decode Repository
-
-First, clone the vhs-decode repository, which contains both the Python scripts and the C++ source code for the ld-tools.
-
-git clone https://github.com/oyvindln/vhs-decode.git
-cd vhs-decode
-
-B. Install Python Components (via pipx)
-
-pipx is recommended for installing Python applications in isolated environments.
-
-    Install pipx (if not already installed):
-
-    python3 -m pip install --user pipx
-    python3 -m pipx ensurepath
-
-    You may need to restart your terminal or source ~/.bashrc for pipx to be in your PATH.
-
-    Install vhs-decode Python tools:
-    Navigate to the root of your cloned vhs-decode directory and install:
-
-    cd /path/to/your/vhs-decode # e.g., ~/vhs-decode
-    pipx install . --force
-
-    This will install ld-decode, ld-compress, and other Python utilities into ~/.local/bin/.
-
-C. Build and Install C++ Components
-
-Many essential ld-tools (like ld-dropout-correct, ld-chroma-decoder, ld-process-vbi) are C++ applications within the vhs-decode repository that need to be compiled.
-
-    Install Build Dependencies:
-
-    sudo apt update
-    sudo apt install build-essential cmake qtbase5-dev libqt5charts5-dev # Essential build tools and Qt libraries
-
-    Note: Depending on your system and specific ld-tools features, you might need more Qt development libraries.
-
-    Build the C++ tools:
-
-    cd /path/to/your/vhs-decode # Ensure you are in the root of the cloned repo
-    mkdir build_cpp # Create a dedicated build directory for C++ components
-    cd build_cpp
-    cmake .. # Configure the build
-    make -j$(nproc) # Compile using all available CPU cores
-
-    Install the C++ tools:
-
-    sudo make install # This installs compiled executables to /usr/local/bin/
-
-D. Install FFmpeg and CCExtractor
-
-sudo apt install ffmpeg ccextractor
-
-E. Configure PATH Environment Variable
-
-It's crucial that your shell finds the correct versions of the ld-tools. pipx installs to ~/.local/bin/, while sudo make install defaults to /usr/local/bin/.
-
-Ensure ~/.local/bin is at the beginning of your PATH to prioritize the pipx versions for ld-decode etc.
-
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-
-Verify your installation:
-
-which ld-decode # Should show /home/(username)/.local/bin/ld-decode
-which ld-dropout-correct # Should show /usr/local/bin/ld-dropout-correct
-which ld-chroma-decoder # Should show /usr/local/bin/ld-chroma-decoder
-which ld-process-vbi # Should show /usr/local/bin/ld-process-vbi
-which ffmpeg
-which ccextractor
-
-5. Usage
-
-To run the script, navigate to its directory and execute it with your base filename.
-
-./ld-compress.sh <base_filename> [--force] [--clean]
-
-    <base_filename>: The base name of your LaserDisc capture files (e.g., LOGH-D3SA). The script expects files like <base_filename>.lds or <base_filename>.flac.ldf to exist.
-
-    --force: (Optional) Runs in non-interactive mode, automatically overwriting any existing intermediate or final files.
-
-    --clean: (Optional) Removes all intermediate files after successful completion of the entire pipeline.
-
-Interactive Prompts:
-
-For each stage that produces an output file, if that file already exists and --force is not used, the script will prompt:
-
-File 'filename' already exists.
+```
+File 'X' already exists.
 Skip [s], Overwrite [o], or Exit [e]?
+```
 
-    s: Skip this stage. The script will proceed to the next stage using the existing file.
+If you skip a stage, the next stage uses the existing file. To redo only some
+stages, skip the ones before them. If every output exists, the prompts come
+in this order:
 
-    o: Overwrite the existing file. The stage will re-run.
+1. `<base>.tbc` (Stage 2)
+2. `<base>_corr.tbc` (Stage 3)
+3. `<base>.vbi.json` (Stage 4)
+4. `<base>_archival.mkv` (Stage 5)
+5. `<base>.srt` (Stage 6)
+6. `<base>_archival_with_subs.mkv` (Stage 7, only if the `.srt` is non-empty)
 
-    e: Exit the script immediately.
+Stage 1 never prompts; it skips on its own if the `.ldf` exists.
 
-6. Workflow Stages
+You can pipe the answers in for an unattended partial re-run. For example,
+this re-encodes the MKV only and redoes captions:
 
-The script executes the following stages sequentially:
-Stage 1: Compress RF Data (.lds → .ldf)
+```bash
+printf 's\ns\ns\no\no\n' | ~/laserdiscs/ld-compress-rust.sh <base_name> --nodeint
+```
 
-    Input: <base_filename>.lds (raw RF capture)
+Both ffmpeg calls use `-nostdin`, so ffmpeg can't eat the piped answers. If the
+input runs out at a prompt, the script aborts instead of looping.
 
-    Output: <base_filename>.flac.ldf (FLAC-compressed RF)
+## Requirements
 
-    Tool: ld-compress
+- `ld-compress`, `ld-dropout-correct`, `ld-process-vbi`, `ld-chroma-decoder`,
+  `ld-analyse` in `/usr/local/bin` (built from ld-decode 7.3.0 / vhs-decode,
+  JSON metadata).
+- `ffmpeg` and `ccextractor` (apt). Without `ccextractor`, Stages 6–7 are
+  skipped with a warning.
+- Python 3 (for the field-count fix).
+- Python version: `~/laserdiscs/ld-decode/ld-decode`.
+- Rust version: a release build of `~/laserdiscs/ld-decode-rust`.
+- Disk: a full side needs hundreds of GB for the `.lds`, `.tbc` and
+  `_corr.tbc` files together. Check free space before you start.
 
-Stage 2: Decode RF to TBC Format (.ldf → .tbc, creates .tbc.json)
+## Known issues
 
-    Input: <base_filename>.lds or <base_filename>.flac.ldf
+- **`--nodeint` MKVs are tagged progressive.** The content is interlaced, but
+  the field order isn't set, so ffprobe reports `field_order=progressive` and
+  some players won't deinterlace (you'll see combing). This is not fixed yet.
+  A fix would add `setfield=tff` / `-field_order tt` to Stage 5, or
+  `mkvpropedit --edit track:v1 --set flag-interlaced=1 --set field-order=1`
+  on existing files. Verify the order with `idet` first, and regenerate the
+  `.sha256` afterwards.
+- **Disc frame numbers vs. capture frames.** `LD_DECODE_START` and
+  `LD_DECODE_LENGTH` count capture frames from the start of the file, not the
+  disc's VBI frame numbers.
+- **Upstream ld-decode has moved to SQLite metadata.** These scripts expect the
+  JSON-era tools (7.3.0). Upgrading the C++ tools will break Stages 3–5 until
+  the scripts are adapted.
 
-    Output: <base_filename>.tbc (TBC video data), <base_filename>.pcm (PCM audio), <base_filename>.efm, <base_filename>.log, <base_filename>.tbc.json (JSON metadata, including dropout detection info).
+## Inspecting results
 
-    Tool: ld-decode
-
-    Note: This version of ld-decode does not support the --dod flag for explicit dropout mask generation, so dropout correction relies on ld-dropout-correct's internal detection.
-
-Stage 3: Perform Dropout Correction (.tbc → _corr.tbc)
-
-    Input: <base_filename>.tbc, <base_filename>.tbc.json
-
-    Output: <base_filename>_corr.tbc (corrected TBC video data)
-
-    Tool: ld-dropout-correct
-
-    Note: This ld-dropout-correct version does not support the --method flag (e.g., interfield+median) and uses its default correction algorithm.
-
-Stage 4: Process VBI Data (_corr.tbc → .vbi.json)
-
-    Input: <base_filename>_corr.tbc (TBC video data), <base_filename>_corr.tbc.json (input JSON metadata).
-
-    Output: <base_filename>.vbi.json (dedicated JSON file containing extracted VBI data).
-
-    Tool: ld-process-vbi
-
-    Note: This stage now explicitly outputs VBI data to a separate .vbi.json file and uses the --nobackup flag to prevent conflicts with its internal backup mechanism.
-
-Stage 5: Chroma Decode, Deinterlace, and Encoding (_corr.tbc → .mkv)
-
-    Input: <base_filename>_corr.tbc, <base_filename>.tbc.json, <base_filename>.pcm
-
-    Output: <base_filename>_archival.mkv (FFV1 encoded video with PCM audio)
-
-    Tools: ld-chroma-decoder (pipes directly to FFmpeg), ffmpeg
-
-    Note: ld-tbc2yuv is NOT used. ld-chroma-decoder outputs raw RGB data directly to ffmpeg via a pipe.
-
-Stage 6: Subtitle Extraction (.mkv → .srt)
-
-    Input: <base_filename>_archival.mkv
-
-    Output: <base_filename>.srt (SRT subtitle file)
-
-    Tool: ccextractor
-
-    Note: If no captions are found in the source, an empty .srt file will be created.
-
-Stage 7: Subtitle Muxing (.mkv + .srt → _archival_with_subs.mkv)
-
-    Input: <base_filename>_archival.mkv, <base_filename>.srt
-
-    Output: <base_filename>_archival_with_subs.mkv (MKV with muxed subtitles)
-
-    Tool: ffmpeg
-
-Stage 8: Generate Checksum (.mkv → .sha256)
-
-    Input: <base_filename>_archival.mkv
-
-    Output: <base_filename>_archival.sha256 (SHA-256 checksum file)
-
-    Tool: sha256sum
-
-Stage 9: Clean up Intermediates
-
-    Action: Removes various intermediate files generated during the process if the --clean flag is used.
-
-7. Important Notes & Troubleshooting
-
-    Hybrid Toolset: Remember that vhs-decode is a mix of Python scripts (installed via pipx) and C++ binaries (compiled from source). Ensure both sets are correctly installed and your PATH prioritizes ~/.local/bin for the Python tools.
-
-    ld-decode --dod: The ld-decode version installed via pipx (e.g., 0.3.5.2.dev94) does not support the --dod flag for explicit dropout mask generation. Dropout correction in Stage 3 relies on ld-dropout-correct's internal detection.
-
-    ld-dropout-correct --method: The C++ ld-dropout-correct tool compiled from vhs-decode source does not support the --method flag. It uses its default correction algorithm.
-
-    ld-process-vbi Output: ld-process-vbi now explicitly outputs to a separate *.vbi.json file. This file's presence is used for skipping Stage 4.
-
-    ld-tbc2yuv Not Used: This script directly pipes the raw RGB output from ld-chroma-decoder to ffmpeg, eliminating the need for ld-tbc2yuv.
-
-    ld-decode Sync Pulse Warnings: If ld-decode reports "Unable to find any sync pulses" or "Field phaseID sequence mismatch," it indicates potential issues with your raw RF capture, LaserDisc condition, or player stability. While the script will attempt to proceed, the resulting video quality may be compromised.
-
-    Disk Space: Archiving LaserDiscs generates very large intermediate files. Ensure you have hundreds of gigabytes, potentially terabytes, of free disk space.
-
-    Permissions: Always ensure your user has full read/write permissions in the working directory.
-
-    FFmpeg Filters: The script uses bwdif for deinterlacing. If you encounter issues with other FFmpeg filters, verify they are compiled into your ffmpeg binary.
-
-8. License
-
-This script is provided under the terms of the GPLv3 license, consistent with the vhs-decode project it utilizes. Please refer to the LICENSE file in the vhs-decode repository for full details.
+```bash
+ld-analyse <base>_corr.tbc        # needs the intermediates (run without --clean)
+ffprobe -hide_banner <base>_archival.mkv
+sha256sum -c <base>_archival.sha256
+```
