@@ -32,8 +32,9 @@ Example:
 ~/laserdiscs/ld-compress-rust.sh RF-Sample_2026-10-01_20-15-01_side1 --nodeint
 ```
 
-Stage 2 reads the first input it finds, in this order: `<base_name>.lds`,
-`<base_name>.ldf`, `<base_name>.flac.ldf`.
+Stage 2 reads the first input it finds, in this order: `<base_name>.ldf`,
+`<base_name>.flac.ldf`, `<base_name>.lds`. The compressed file is preferred
+when both exist. If you only have an `.ldf`, no `.lds` is needed.
 
 ### Flags
 

@@ -86,15 +86,16 @@ fi
 echo "==> Stage 2: Decoding RF to TBC format with dropout masks"
 # Determine the RF input file
 RF_INPUT=""
-if [ -e "${BASE_NAME}.lds" ]; then
-  RF_INPUT="${BASE_NAME}.lds"
-  echo "Using raw RF: ${BASE_NAME}.lds for initial decode."
-elif [ -e "${BASE_NAME}.ldf" ]; then
+# Prefer the compressed .ldf (from Stage 1 or pre-existing) over the raw .lds
+if [ -e "${BASE_NAME}.ldf" ]; then
   RF_INPUT="${BASE_NAME}.ldf"
   echo "Using compressed RF: ${BASE_NAME}.ldf for initial decode."
 elif [ -e "${BASE_NAME}.flac.ldf" ]; then
   RF_INPUT="${BASE_NAME}.flac.ldf"
   echo "Using FLAC compressed RF: ${BASE_NAME}.flac.ldf for initial decode."
+elif [ -e "${BASE_NAME}.lds" ]; then
+  RF_INPUT="${BASE_NAME}.lds"
+  echo "Using raw RF: ${BASE_NAME}.lds for initial decode."
 else
   echo "Error: No .lds, .ldf, or .flac.ldf file found for initial RF decode."
   exit 1
